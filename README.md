@@ -1,5 +1,3 @@
-# Looks like the code is currently broken, I haven't found the time yet to fix it
-
 <hr>
 
 # Discord-Hetzner-Bot
