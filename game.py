@@ -4,83 +4,107 @@ from hcloud.servers.domain import Server
 from hcloud.server_types.domain import ServerType
 from hcloud.volumes.domain import Volume
 from hcloud.locations.domain import Location
-import time
 import asyncio
 
 class GameData:
     running = False
-    
+
     def __init__(self, token, name, servertype, snapshot, location, volume):
         self.name = name
-        self.servertype = servertype
+        self.servertype = servertype.strip() if isinstance(servertype, str) else servertype
         self.client = Client(token=token)
-        
-        # get id from snapshot
-        images = self.client.images.get_all()
-        for i in images:
-            if i.data_model.description == snapshot:
-                imageId = i.data_model.id
-        self.snapshot = imageId
 
-        # get id from location
+        # --- snapshot/image (optional) ---
+        # If snapshot is None => we'll fall back to Ubuntu 24.04 in start()
+        self.snapshot = None
+        if snapshot is not None:
+            images = self.client.images.get_all()
+            for img in images:
+                # support matching by description OR name
+                if img.data_model.description == snapshot or img.data_model.name == snapshot:
+                    self.snapshot = img.data_model.id
+                    break
+            if self.snapshot is None:
+                raise ValueError(f"Snapshot/Image not found: {snapshot}")
+
+        # --- location (required) ---
+        self.location = None
         locations = self.client.locations.get_all()
-        for i in locations:
-            if i.data_model.name == location:
-                locationId = i.data_model.id
-        self.location = locationId
+        for loc in locations:
+            if loc.data_model.name == location:
+                self.location = loc.data_model.id
+                break
+        if self.location is None:
+            raise ValueError(f"Location not found: {location}")
 
-        # get id from volume
-        volumes = self.client.volumes.get_all()
-        for i in volumes:
-            if i.data_model.name == volume:
-                if i.data_model.location.data_model.id == self.location:
-                    volumeId = i.data_model.id
-        self.volume = volumeId
+        # --- volume (optional) ---
+        self.volume = None
+        if volume is not None:
+            volumes = self.client.volumes.get_all()
+            for vol in volumes:
+                if vol.data_model.name == volume and vol.data_model.location.data_model.id == self.location:
+                    self.volume = vol.data_model.id
+                    break
+            if self.volume is None:
+                raise ValueError(f"Volume not found in location {location}: {volume}")
 
-        # check for running server
+        # --- check for existing server by name ---
         servers = self.client.servers.get_all()
         self.server = None
-        for i in servers:
-            if i.data_model.name == name:
-                self.server = i.data_model
+        for s in servers:
+            if s.data_model.name == name:
+                self.server = s  # keep the Server object
                 self.running = True
                 print("existing server " + self.server.status)
 
     async def start(self):
-        if self.running == False:
+        if not self.running:
             print("Starting " + self.name)
+
+            # Choose image:
+            # - if snapshot provided => use that snapshot image id
+            # - else => boot from Ubuntu 24.04 (Hetzner public image name)
+            image = Image(self.snapshot) if self.snapshot is not None else "ubuntu-24.04"
+
+            # Attach volume only if configured
+            volumes = [Volume(self.volume)] if self.volume is not None else None
+
             response = self.client.servers.create(
-                self.name,
+                name=self.name,
                 server_type=ServerType(name=self.servertype),
-                image=Image(self.snapshot),
+                image=image,
                 location=Location(self.location),
-                volumes=[Volume(self.volume)]
+                volumes=volumes
             )
-            self.server = response.server;
-            #while self.server.status != Server.STATUS_RUNNING:
-            #    print(self.server.status)
-            #    time.sleep(2)
-            #    serv = self.client.servers.get_by_id(self.server.id)
-            #    self.server = serv
-            #print("Server is now running")
+            self.server = response.server
             self.running = True
         else:
             print(self.name + " is already running")
 
     async def stop(self):
-        if self.running == True:
+        if self.running:
             print("Stopping " + self.name)
+
             self.client.servers.shutdown(self.server)
-            time.sleep(30)
-            while self.server.status != Server.STATUS_OFF:
-                print(self.server.status)
-                time.sleep(5)
+
+            # Give it time to begin shutdown, then poll status
+            await asyncio.sleep(5)
+
+            while True:
                 serv = self.client.servers.get_by_id(self.server.id)
                 self.server = serv
+                print(self.server.status)
+                if self.server.status == Server.STATUS_OFF:
+                    break
+                await asyncio.sleep(5)
+
             print("Server is now stopped")
-            time.sleep(1)
-            self.client.volumes.detach(Volume(self.volume))
-            time.sleep(1)
+
+            # Detach volume only if configured
+            if self.volume is not None:
+                self.client.volumes.detach(Volume(self.volume))
+                await asyncio.sleep(1)
+
             self.client.servers.delete(self.server)
             self.running = False
             self.server = None
@@ -89,7 +113,7 @@ class GameData:
 
     def status(self):
         msg = self.name
-        if self.server == None:
+        if self.server is None:
             msg += " isn't running"
         else:
             self.server = self.client.servers.get_by_id(self.server.id)
@@ -103,4 +127,3 @@ class GameData:
 
     def isRunning(self):
         return self.running
-
